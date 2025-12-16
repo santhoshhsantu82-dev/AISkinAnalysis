@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI Skin Analyzer — Live Scan + PDF Report</title>
+
+  <!-- Simple UI styles (kept small & readable) -->
+  <style>
+    :root{--bg:#f6f9ff;--card:#ffffff;--accent:#2b6ef6;--muted:#616770}
+    *{box-sizing:border-box}
+    body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial; margin:0;background:var(--bg);color:#222}
+    .wrap{max-width:980px;margin:28px auto;padding:20px}
+    header{display:flex;align-items:center;gap:16px}
+    h1{margin:0;font-size:20px}
+    .card{background:var(--card);border-radius:12px;padding:16px;box-shadow:0 6px 18px rgba(20,30,80,0.06);}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+    input[type=file]{display:inline-block}
+    button{background:var(--accent);color:white;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+    button.secondary{background:transparent;color:var(--accent);border:1px solid rgba(43,110,246,0.12)}
+    .grid{display:grid;grid-template-columns:1fr 360px;gap:16px;margin-top:16px}
+    .canvas-wrap{display:flex;flex-direction:column;gap:8px}
+    canvas{background:#fff;border-radius:8px;border:1px solid #e6eefb;max-width:100%}
+    video{border-radius:8px;max-width:100%;display:block}
+    .analysis{display:flex;flex-direction:column;gap:8px}
+    .result{padding:10px;border-radius:8px;background:#fbfdff;border:1px solid #eef6ff}
+    .progress-list{max-height:300px;overflow:auto;margin-top:8px}
+    .entry{padding:8px;border-bottom:1px dashed #eee}
+    .download{margin-top:8px}
+    .small{font-size:13px;color:var(--muted)}
+    footer{margin-top:18px;font-size:13px;color:var(--muted)}
+    .status{font-weight:600;margin-top:6px}
+    @media(max-width:920px){.grid{grid-template-columns:1fr}}
+    .row{display:flex;gap:8px;align-items:center}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div style="width:56px;height:56px;border-radius:12px;background:linear-gradient(135deg,#2b6ef6,#7bd1ff);display:flex;align-items:center;justify-content:center;color:white;font-weight:700">AI</div>
+      <div>
+        <h1>AI Skin Analyzer — Live Scan + PDF</h1>
+        <div class="small">Live camera analysis for acne & pigmentation. Download a PDF report with snapshot & suggestions. Client-side only.</div>
+      </div>
+    </header>
+
+    <div class="card">
+      <div class="controls">
+        <input id="fileInput" type="file" accept="image/*" />
+        <button id="startCam">Start Live Scan</button>
+        <button id="stopCam" class="secondary" disabled>Stop Live Scan</button>
+        <button id="capture" class="secondary">Capture Snapshot</button>
+        <button id="downloadPdf">Download PDF Report</button>
+        <button id="saveEntry" class="secondary">Save Progress</button>
+        <button id="clearProgress" class="secondary">Clear Progress</button>
+      </div>
+
+      <div class="grid">
+        <div>
+          <div class="canvas-wrap">
+            <video id="video" playsinline autoplay style="display:none"></video>
+            <canvas id="canvas" width="640" height="480"></canvas>
+            <div class="small">Tip: face the camera in natural light, remove heavy makeup and keep ~20–40 cm distance.</div>
+            <div id="liveStatus" class="status small">Live scan: stopped</div>
+          </div>
+        </div>
+
+        <div class="analysis">
+          <div class="result">
+            <div><strong>Analysis</strong></div>
+            <div id="summary" class="small">No image loaded yet.</div>
+          </div>
+
+          <div class="result">
+            <div><strong>AM / PM Routine Suggestions</strong></div>
+            <div id="suggestions" class="small">Suggestions will appear after analysis.</div>
+          </div>
+
+          <div class="result">
+            <div style="display:flex;justify-content:space-between;align-items:center"><strong>Progress Tracker</strong></div>
+            <div class="progress-list" id="progressList"></div>
+          </div>
+        </div>
+      </div>
+
+      <footer>
+        This demo uses simple pixel heuristics — not a medical diagnosis. For persistent or severe skin issues consult a dermatologist.
+      </footer>
+    </div>
+  </div>
+
+  <!-- Libraries: html2canvas + jsPDF (UMD) from CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" integrity="" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" integrity="" crossorigin="anonymous"></script>
+
+  <script>
+  // ------------ Elements ------------
+  const fileInput = document.getElementById('fileInput');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const video = document.getElementById('video');
+  const startCam = document.getElementById('startCam');
+  const stopCam = document.getElementById('stopCam');
+  const captureBtn = document.getElementById('capture');
+  const downloadPdfBtn = document.getElementById('downloadPdf');
+  const summaryEl = document.getElementById('summary');
+  const suggestionsEl = document.getElementById('suggestions');
+  const saveEntryBtn = document.getElementById('saveEntry');
+  const progressList = document.getElementById('progressList');
+  const clearProgressBtn = document.getElementById('clearProgress');
+  const liveStatus = document.getElementById('liveStatus');
+
+  // ------------ State ------------
+  let currentImage = null;
+  let liveScanning = false;
+  let videoStream = null;
+  let liveRAF = null; // requestAnimationFrame id
+
+  // ------------ Helpers ------------
+  function fitCanvasToImage(img){
+    const maxW = 640; const maxH = 480;
+    let w = img.width, h = img.height;
+    const ratio = Math.min(maxW/w, maxH/h, 1);
+    canvas.width = Math.round(w*ratio);
+    canvas.height = Math.round(h*ratio);
+    ctx.drawImage(img,0,0,canvas.width,canvas.height);
+  }
+
+  function updateSummary(text){ summaryEl.textContent = text; }
+
+  // ------------ File input (static image) ------------
+  fileInput.addEventListener('change', (e)=>{
+    const f = e.target.files && e.target.files[0];
+    if(!f) return;
+    const img = new Image();
+    img.onload = ()=>{
+      currentImage = img;
+      fitCanvasToImage(img);
+      stopCamera(); // stop live if running
+      updateSummary('Image loaded. Live scan stopped. Analysis updated.');
+      runAnalysisOnce(); // analyze static image once
+    }
+    img.src = URL.createObjectURL(f);
+  });
+
+  // ------------ Camera control & live scan loop ------------
+  startCam.addEventListener('click', async ()=>{
+    try{
+      videoStream = await navigator.mediaDevices.getUserMedia({video: {facingMode:'user', width:1280, height:720}, audio:false});
+      video.srcObject = videoStream;
+      video.style.display = 'block';
+      startCam.disabled = true;
+      stopCam.disabled = false;
+      liveScanning = true;
+      liveStatus.textContent = 'Live scan: running';
+      // start draw loop
+      drawVideoFrame();
+    }catch(err){
+      alert('Camera access denied or not available: ' + (err && err.message));
+    }
+  });
+
+  stopCam.addEventListener('click', ()=>{
+    stopCamera();
+    updateSummary('Live scan stopped.');
+  });
+
+  function stopCamera(){
+    liveScanning = false;
+    startCam.disabled = false;
+    stopCam.disabled = true;
+    liveStatus.textContent = 'Live scan: stopped';
+    if(videoStream){
+      videoStream.getTracks().forEach(t=>t.stop());
+      videoStream = null;
+    }
+    if(liveRAF) cancelAnimationFrame(liveRAF);
+    video.style.display = 'none';
+  }
+
+  function drawVideoFrame(){
+    if(video.srcObject && video.readyState >= 2){
+      // fit video to canvas
+      const vw = video.videoWidth || 640; const vh = video.videoHeight || 480;
+      const ratio = Math.min(640/vw,480/vh,1);
+      canvas.width = Math.round(vw*ratio);
+      canvas.height = Math.round(vh*ratio);
+      ctx.drawImage(video,0,0,canvas.width,canvas.height);
+      // continuously analyze every Nth frame (throttle)
+      // We'll analyze every ~10 frames to save CPU
+      if(!canvas._frameCounter) canvas._frameCounter = 0;
+      canvas._frameCounter = (canvas._frameCounter + 1) % 10;
+      if(canvas._frameCounter === 0){
+        const res = analyzeImage();
+        displayAnalysis(res);
+      }
+    }
+    if(liveScanning) liveRAF = requestAnimationFrame(drawVideoFrame);
+  }
+
+  // Manual capture snapshot (freezes current canvas into currentImage)
+  captureBtn.addEventListener('click', ()=>{
+    const img = new Image();
+    img.onload = ()=>{
+      currentImage = img;
+      updateSummary('Snapshot captured. Live scan paused for snapshot view.');
+      // stopCamera(); // optional: keep live going — here we do not stop
+    }
+    img.src = canvas.toDataURL('image/png');
+  });
+
+  // ------------ Analysis (same heuristics as before, wrapped) ------------
+  function analyzeImage(){
+    if(!canvas.width || !canvas.height) return null;
+    const imgd = ctx.getImageData(0,0,canvas.width,canvas.height);
+    const data = imgd.data;
+    const total = canvas.width*canvas.height;
+
+    let redCount = 0; // probable acne/redness
+    let darkCount = 0; // pigmentation/dark spots
+    let brightSum = 0;
+    let satSum = 0;
+
+    for(let i=0;i<data.length;i+=4){
+      const r = data[i], g = data[i+1], b = data[i+2];
+      const lum = 0.2126*r + 0.7152*g + 0.0722*b;
+      brightSum += lum;
+      const maxc = Math.max(r,g,b), minc = Math.min(r,g,b);
+      const sat = maxc===0?0:((maxc-minc)/maxc);
+      satSum += sat;
+
+      if(r>140 && r>g+25 && r>b+25 && (r/Math.max(1,g))>1.1) redCount++;
+      if(lum < 70 && sat>0.15) darkCount++;
+    }
+
+    const avgBright = brightSum/total;
+    const avgSat = satSum/(total);
+    const redRatio = redCount/total;
+    const darkRatio = darkCount/total;
+
+    // classify acne severity
+    let acne = {present:false,severity:'None',score:redRatio};
+    if(redRatio>0.02) { acne.present=true; acne.severity='Severe'; }
+    else if(redRatio>0.007) { acne.present=true; acne.severity='Moderate'; }
+    else if(redRatio>0.002) { acne.present=true; acne.severity='Mild'; }
+
+    // pigmentation
+    let pigmentation = {present:false,level:'None',score:darkRatio};
+    if(darkRatio>0.01){ pigmentation.present=true; pigmentation.level='High'; }
+    else if(darkRatio>0.004){ pigmentation.present=true; pigmentation.level='Moderate'; }
+    else if(darkRatio>0.001){ pigmentation.present=true; pigmentation.level='Low'; }
+
+    // skin type heuristics
+    let skinType = 'Normal';
+    if(avgBright>150) skinType = 'Oily';
+    else if(avgBright<120) skinType = 'Dry';
+    if(avgSat>0.25 && skinType==='Normal') skinType = 'Combination';
+
+    return {acne,pigmentation,skinType,metrics:{avgBright:avgBright.toFixed(2),avgSat:avgSat.toFixed(3),redRatio:redRatio, darkRatio:darkRatio}};
+  }
+
+  // display analysis results (update UI)
+  function displayAnalysis(res){
+    if(!res) return;
+    const lines = [];
+    lines.push('Skin Type: ' + res.skinType);
+    lines.push('Acne: ' + (res.acne.present ? res.acne.severity + ' (' + (res.metrics.redRatio*100).toFixed(2) + '% red pixels)' : 'None detected'));
+    lines.push('Pigmentation/Dark spots: ' + (res.pigmentation.present ? res.pigmentation.level + ' (' + (res.metrics.darkRatio*100).toFixed(2) + '% dark pixels)' : 'None detected'));
+    updateSummary(lines.join(' | '));
+    suggestionsEl.innerHTML = buildSuggestionsHTML(res);
+  }
+
+  function runAnalysisOnce(){
+    const res = analyzeImage();
+    displayAnalysis(res);
+  }
+
+  // ------------ Suggestions builder (same logic) ------------
+  function buildSuggestionsHTML(res){
+    const sug = makeSuggestions(res);
+    return '<strong>AM:</strong><br>' + sug.am.map((s,i)=> (i+1)+'. '+s+'<br>').join('') + '<br><strong>PM:</strong><br>' + sug.pm.map((s,i)=>(i+1)+'. '+s+'<br>').join('');
+  }
+
+  function makeSuggestions(res){
+    const am = [];
+    const pm = [];
+    am.push('Cleanse with a gentle, non-stripping cleanser (pat dry).');
+    am.push('Apply a lightweight antioxidant serum (Vitamin C) — helps pigmentation.');
+    am.push('Use a broad-spectrum sunscreen SPF 30+; reapply every 2-3 hours if outdoors.');
+
+    pm.push('Double cleanse if wearing sunscreen/makeup (oil/balm then gentle cleanser).');
+    pm.push('Apply targeted treatments according to conditions (see below).');
+    pm.push('Finish with a moisturizer appropriate for your skin type.');
+
+    if(res.skinType==='Oily'){
+      am.push('Use oil-free, non-comedogenic moisturizer.');
+      pm.push('Use water-based moisturizer or gel; avoid heavy creams.');
+    }else if(res.skinType==='Dry'){
+      am.push('Use a richer moisturizer and consider hydrating serum (hyaluronic acid).');
+      pm.push('Use occlusive layer (e.g., petroleum or thick night cream) if intensely dry.');
+    }else if(res.skinType==='Combination'){
+      am.push('Use gentle foaming or gel cleanser targeting T-zone.');
+      pm.push('Use lighter products on T-zone and richer on cheeks if needed.');
+    }
+
+    if(res.acne.present){
+      am.push('Spot treat active pimples with 2.5-5% benzoyl peroxide or 1-2% salicylic acid (as tolerated).');
+      pm.push('Consider nightly retinoid (start 2-3x/week) to reduce comedones and inflammation; consult dermatologist if unsure.');
+      pm.push('Avoid heavy occlusive products on acne-prone areas.');
+    }
+
+    if(res.pigmentation.present){
+      am.push('Use Vitamin C or niacinamide in AM to help brightening.');
+      pm.push('Use gentle chemical exfoliant (AHA) 1-3x/week to help even tone — avoid combining with retinoid on same night unless tolerated.');
+      pm.push('Consider products with tranexamic acid or azelaic acid (consult dermatologist).');
+    }
+
+    pm.push('If irritation occurs, reduce frequency and consult a dermatologist. Patch-test new actives.');
+
+    return {am,pm};
+  }
+
+  // ------------ Progress tracking (localStorage) ------------
+  function loadProgress(){
+    const raw = localStorage.getItem('skin_progress');
+    const arr = raw ? JSON.parse(raw) : [];
+    progressList.innerHTML = '';
+    arr.slice().reverse().forEach(entry=>{
+      const d = document.createElement('div'); d.className='entry';
+      d.innerHTML = '<div style="font-weight:600">'+entry.date+'</div><div class="small">'+entry.summary+'</div><div style="margin-top:6px"><button onclick="downloadSavedEntry(\''+entry.id+'\')" class="secondary">Download</button></div>';
+      progressList.appendChild(d);
+    });
+  }
+
+  function saveCurrentEntry(){
+    const res = analyzeImage();
+    if(!res){ alert('No analysis to save.'); return; }
+    const raw = localStorage.getItem('skin_progress');
+    const arr = raw ? JSON.parse(raw) : [];
+    const id = 'e'+Date.now();
+    const entry = {id,date:new Date().toLocaleString(),summary:summaryEl.textContent,suggestions:suggestionsEl.innerHTML,metrics:res.metrics};
+    arr.push(entry);
+    localStorage.setItem('skin_progress', JSON.stringify(arr));
+    loadProgress();
+    alert('Progress saved locally.');
+  }
+
+  saveEntryBtn.addEventListener('click', saveCurrentEntry);
+  clearProgressBtn.addEventListener('click', ()=>{
+    if(confirm('Clear all saved progress?')){ localStorage.removeItem('skin_progress'); loadProgress(); }
+  });
+
+  window.downloadSavedEntry = function(id){
+    const raw = localStorage.getItem('skin_progress');
+    const arr = raw ? JSON.parse(raw) : [];
+    const e = arr.find(x=>x.id===id);
+    if(!e) return;
+    // Create a simple text download (keeps it small)
+    const text = 'Date: '+e.date+'\n\nSummary:\n'+e.summary+'\n\nSuggestions:\n'+stripHtml(e.suggestions)+'\n\nMetrics:\n'+JSON.stringify(e.metrics,null,2);
+    const blob = new Blob([text],{type:'text/plain'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'skin-suggestion-'+e.id+'.txt'; a.click(); URL.revokeObjectURL(url);
+  };
+
+  function stripHtml(html){ const d = document.createElement('div'); d.innerHTML = html; return d.textContent || d.innerText || ''; }
+
+  loadProgress(); // init
+
+  // ------------ PDF generation (jsPDF + canvas snapshot) ------------
+  downloadPdfBtn.addEventListener('click', async ()=>{
+    // Ensure there's an analysis to include
+    const res = analyzeImage();
+    if(!res){ alert('No current analysis to include in PDF. Load or start live scan.'); return; }
+
+    // Freeze current canvas snapshot into an image for the PDF
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+
+    // Create jsPDF document (A4 portrait)
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'pt', format: 'a4' }); // using points
+
+    const margin = 40;
+    const pageW = doc.internal.pageSize.getWidth();
+    let y = margin;
+
+    // Title
+    doc.setFontSize(18);
+    doc.setTextColor(20,30,80);
+    doc.text('AI Skin Analyzer Report', margin, y);
+    y += 24;
+
+    // Date/time
+    doc.setFontSize(11);
+    doc.setTextColor(80,80,80);
+    doc.text('Generated: ' + new Date().toLocaleString(), margin, y);
+    y += 18;
+
+    // Add snapshot image (fit to width)
+    const imgMaxW = pageW - margin*2;
+    // compute image height preserving aspect ratio
+    const img = new Image();
+    img.src = dataUrl;
+    img.onload = ()=>{
+      const ratio = img.width ? (img.height / img.width) : (3/4);
+      const imgW = Math.min(imgMaxW, img.width);
+      const imgH = imgW * ratio;
+      doc.addImage(dataUrl, 'JPEG', margin, y, imgW, imgH, undefined, 'FAST');
+      y += imgH + 12;
+
+      // Divider
+      doc.setDrawColor(230,230,240);
+      doc.setLineWidth(0.5);
+      doc.line(margin, y, pageW-margin, y);
+      y += 14;
+
+      // Summary & metrics
+      doc.setFontSize(12);
+      doc.setTextColor(20,20,30);
+      doc.text('Summary:', margin, y);
+      y += 16;
+      doc.setFontSize(10);
+      const summaryText = summaryEl.textContent || '';
+      // wrap text into PDF width
+      const splitSummary = doc.splitTextToSize(summaryText, pageW - margin*2);
+      doc.text(splitSummary, margin, y);
+      y += splitSummary.length * 12 + 8;
+
+      // Metrics
+      doc.setFontSize(12);
+      doc.text('Metrics:', margin, y);
+      y += 16;
+      doc.setFontSize(10);
+      const metrics = res.metrics;
+      const metricsText = [
+        'Average Brightness: ' + metrics.avgBright,
+        'Average Saturation: ' + metrics.avgSat,
+        'Red pixel ratio: ' + (metrics.redRatio*100).toFixed(3) + '%',
+        'Dark pixel ratio: ' + (metrics.darkRatio*100).toFixed(3) + '%'
+      ];
+      doc.text(metricsText, margin, y);
+      y += metricsText.length * 12 + 12;
+
+      // Suggestions
+      doc.setFontSize(12);
+      doc.text('AM / PM Suggestions:', margin, y);
+      y += 16;
+      doc.setFontSize(10);
+      const sugText = stripHtml(suggestionsEl.innerHTML);
+      const splitSug = doc.splitTextToSize(sugText, pageW - margin*2);
+      doc.text(splitSug, margin, y);
+      y += splitSug.length * 12 + 12;
+
+      // Footer note
+      doc.setFontSize(9);
+      doc.setTextColor(100,100,110);
+      doc.text('Note: This is a heuristic demo only — not a medical diagnosis. Consult a dermatologist for medical advice.', margin, doc.internal.pageSize.getHeight() - margin);
+
+      // Save PDF
+      doc.save('ai-skin-report-' + Date.now() + '.pdf');
+    };
+
+    // If image fails to load for some reason, fallback to simple PDF with text only
+    img.onerror = ()=>{
+      doc.setFontSize(12);
+      doc.text('Summary:', margin, y);
+      y += 16;
+      doc.setFontSize(10);
+      const splitSummary = doc.splitTextToSize(summaryEl.textContent || '', pageW - margin*2);
+      doc.text(splitSummary, margin, y);
+      y += splitSummary.length * 12 + 12;
+      doc.save('ai-skin-report-' + Date.now() + '.pdf');
+    };
+  });
+
+  // Analyze once on page load if canvas already has something (rare)
+  runAnalysisOnce();
+
+  // Stop camera when page hidden or unloaded to free camera
+  document.addEventListener('visibilitychange', ()=>{ if(document.hidden) stopCamera(); });
+  window.addEventListener('beforeunload', ()=>{ stopCamera(); });
+
+  </script>
+</body>
+</html>
